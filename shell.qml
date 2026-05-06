@@ -1,5 +1,7 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
+import "shared"
 import "widgets/clockDigital" as ClockDigital
 import "widgets/clockAnalog" as ClockAnalog
 import "widgets/battery" as Battery
@@ -8,115 +10,223 @@ import "widgets/date" as DateWidget
 import "widgets/launcher" as Launcher
 
 ShellRoot {
+    id: shellRoot
+
     // ============================================================
-    // Each widget supports:
-    //   • Left-click + drag → move freely on the desktop
-    //   • Right-click       → cycle to next variant (where >1 exists)
-    //   • Smooth slide      → animates posX/posY changes from config
+    // The active layout lives in ~/.config/nothing-widgets/layout.json
+    // and is the single source of truth — drag a widget, cycle a
+    // variant, or send an IPC call: all of it persists. Editing the
+    // file by hand also reloads (watched).
     //
-    // Config below sets the *initial* values. Quickshell hot-reloads
-    // on save, so you can tweak anything without restarting.
+    // To mutate from a terminal:
+    //   qs ipc call nothing list
+    //   qs ipc call nothing toggle clockDigital1
+    //   qs ipc call nothing setVisible clockDigital1 false
+    //   qs ipc call nothing add weather '{"posX":600,"posY":40}'
+    //   qs ipc call nothing remove weather2
+    //   qs ipc call nothing update clockDigital1 themeMode 1
+    //   qs ipc call nothing update weather1 props.location '"Tokyo, JP"'
     //
-    // The Launcher at the bottom is the on-screen control panel:
-    // click a chip to show/hide that widget. It binds to each
-    // widget's `visible` property by id.
+    // First run: the file doesn't exist yet, so the model seeds itself
+    // with one of every widget at sensible positions.
     // ============================================================
 
-    // ---------------- Digital Clock ----------------
-    ClockDigital.ClockDigitalWindow {
-        id: clockDigital
+    LayoutModel { id: layoutModel }
 
-        variant: 0              // 0 = digital, 1 = world clock
-        themeMode: 0            // 0 = dark, 1 = light
-        use24HourFormat: false
+    // ---- Components for dynamic instantiation ----
+    Component { id: clockDigitalComp; ClockDigital.ClockDigitalWindow {} }
+    Component { id: clockAnalogComp;  ClockAnalog.ClockAnalogWindow  {} }
+    Component { id: batteryComp;      Battery.BatteryWindow          {} }
+    Component { id: weatherComp;      Weather.WeatherWindow          {} }
+    Component { id: dateComp;         DateWidget.DateWindow          {} }
+    Component { id: launcherComp;     Launcher.LauncherWindow        {} }
 
-        // World-clock options (used when variant === 1)
-        cityName: "Gariyaband"
-        timeZone: "India"
+    // Live instances keyed by id. Stored on the QtObject so QML's GC
+    // doesn't collect the windows.
+    QtObject {
+        id: factory
+        property var instances: ({})
 
-        posX: 40
-        posY: 40
+        function componentFor(type) {
+            switch (type) {
+            case "clockDigital": return clockDigitalComp
+            case "clockAnalog":  return clockAnalogComp
+            case "battery":      return batteryComp
+            case "weather":      return weatherComp
+            case "date":         return dateComp
+            case "launcher":     return launcherComp
+            }
+            return null
+        }
 
-        // Aspect ratio >= 1.8 → pill mode. 320×100 → pill, 220×220 → square.
-        widgetWidth: 320
-        widgetHeight: 100
+        function shortLabel(type) {
+            const map = {
+                "clockDigital": "Clock", "clockAnalog": "Analog",
+                "battery": "Bat", "weather": "Wthr",
+                "date": "Date", "launcher": "Dock"
+            }
+            return map[type] || type
+        }
+
+        function applySpec(inst, spec) {
+            if (spec.posX !== undefined && "posX" in inst) inst.posX = spec.posX
+            if (spec.posY !== undefined && "posY" in inst) inst.posY = spec.posY
+            if (spec.variant !== undefined && "variant" in inst) inst.variant = spec.variant
+            if (spec.themeMode !== undefined && "themeMode" in inst) inst.themeMode = spec.themeMode
+            if ("visible" in inst) inst.visible = spec.visible !== false
+            if (spec.size) {
+                if ("size" in spec.size && "widgetSize" in inst) inst.widgetSize = spec.size.size
+                if ("width" in spec.size && "widgetWidth" in inst) inst.widgetWidth = spec.size.width
+                if ("height" in spec.size && "widgetHeight" in inst) inst.widgetHeight = spec.size.height
+            }
+            if (spec.props) {
+                for (const key in spec.props) {
+                    if (key in inst) inst[key] = spec.props[key]
+                }
+            }
+        }
+
+        function createOne(spec) {
+            const comp = componentFor(spec.type)
+            if (!comp) { console.warn("Unknown widget type:", spec.type); return }
+            const inst = comp.createObject(shellRoot)
+            if (!inst) { console.warn("Failed to create:", spec.type); return }
+            applySpec(inst, spec)
+
+            const id = spec.id
+
+            // Writebacks fire on the *discrete* user actions, not on every
+            // posXChanged tick — otherwise the Behavior animation feeds its
+            // intermediate values back through the model and hijacks itself.
+            inst.dragged.connect(function() {
+                if (!factory.instances[id]) return
+                layoutModel.updateItem(id, "posX", inst.posX)
+                layoutModel.updateItem(id, "posY", inst.posY)
+            })
+            inst.variantCycled.connect(function() {
+                if (!factory.instances[id]) return
+                layoutModel.updateItem(id, "variant", inst.variant)
+            })
+            // Visibility has no Behavior animation — safe to track on change.
+            inst.visibleChanged.connect(function() {
+                if (factory.instances[id]) layoutModel.updateItem(id, "visible", inst.visible)
+            })
+
+            factory.instances[id] = inst
+            if (spec.type === "launcher") refreshLauncher(inst)
+        }
+
+        function destroyOne(id) {
+            const inst = factory.instances[id]
+            if (inst) {
+                inst.destroy()
+                delete factory.instances[id]
+                refreshAllLaunchers()
+            }
+        }
+
+        function applyUpdate(id, key, value) {
+            const inst = factory.instances[id]
+            if (!inst) return
+            if (key.indexOf(".") !== -1) {
+                const parts = key.split(".")
+                const top = parts[0]
+                const sub = parts.slice(1).join(".")
+                if (top === "size") {
+                    if (sub === "size" && "widgetSize" in inst) inst.widgetSize = value
+                    else if (sub === "width" && "widgetWidth" in inst) inst.widgetWidth = value
+                    else if (sub === "height" && "widgetHeight" in inst) inst.widgetHeight = value
+                } else if (top === "props" && sub in inst) {
+                    inst[sub] = value
+                }
+            } else if (key in inst) {
+                inst[key] = value
+            }
+        }
+
+        function rebuild() {
+            for (const id in instances) instances[id].destroy()
+            instances = {}
+            for (const spec of layoutModel.items) createOne(spec)
+        }
+
+        // Launcher: bind its `items` chip list to whatever else is in the model.
+        function refreshLauncher(inst) {
+            const out = []
+            for (const s of layoutModel.items) {
+                if (s.type === "launcher") continue
+                const target = factory.instances[s.id]
+                if (!target) continue
+                out.push({ label: shortLabel(s.type), target: target })
+            }
+            inst.items = out
+        }
+
+        function refreshAllLaunchers() {
+            for (const id in instances) {
+                // Cheap structural test for "is launcher": presence of `items` array property.
+                const inst = instances[id]
+                if (inst && "items" in inst && Array.isArray(inst.items)) refreshLauncher(inst)
+            }
+        }
     }
 
-    // ---------------- Analog Clock ----------------
-    ClockAnalog.ClockAnalogWindow {
-        id: clockAnalog
-
-        variant: 0              // 0 = Swiss, 1 = Minimalist (pill hands)
-        themeMode: 0
-        smoothHands: true       // false = ticking each second
-
-        posX: 40
-        posY: 160
-        widgetSize: 220
+    Connections {
+        target: layoutModel
+        function onLayoutReloaded() { factory.rebuild() }
+        function onItemAdded(spec) {
+            factory.createOne(spec)
+            factory.refreshAllLaunchers()
+        }
+        function onItemRemoved(id) { factory.destroyOne(id) }
+        function onItemUpdated(id, key, value) { factory.applyUpdate(id, key, value) }
     }
 
-    // ---------------- Battery ----------------
-    Battery.BatteryWindow {
-        id: battery
+    // ---- IPC: `qs ipc call nothing <fn> [args...]` ----
+    IpcHandler {
+        target: "nothing"
 
-        themeMode: 0
-        showBluetoothDevices: true   // false = laptop battery only
+        function add(type: string, optsJson: string): string {
+            let opts = {}
+            if (optsJson) { try { opts = JSON.parse(optsJson) } catch (e) {} }
+            const spec = Object.assign(
+                { type: type, variant: 0, themeMode: 0, posX: 100, posY: 100, visible: true },
+                opts
+            )
+            return layoutModel.addItem(spec) || ""
+        }
 
-        posX: 400
-        posY: 40
-        widgetSize: 220
-    }
+        function remove(id: string): void { layoutModel.removeItem(id) }
 
-    // ---------------- Weather ----------------
-    // Right-click cycles 4 variants:
-    //   0 = Rect Daily   (480×180 wide — header + 6-day forecast)
-    //   1 = Rect Hourly  (480×180 wide — header + next 6 hours)
-    //   2 = Square Now   (220×220 — temp + icon + city)
-    //   3 = Square H/L   (220×220 — high/low + condition)
-    // Uses Open-Meteo (free, no API key).
-    Weather.WeatherWindow {
-        id: weather
+        function update(id: string, key: string, valueJson: string): void {
+            let v = valueJson
+            try { v = JSON.parse(valueJson) } catch (e) {}
+            layoutModel.updateItem(id, key, v)
+        }
 
-        variant: 0                  // start on Rect Daily
-        themeMode: 0
-        location: "Raipur, IN"      // city, optional country/region hints
-        temperatureUnit: 0          // 0 = °C, 1 = °F
+        function toggle(id: string): void {
+            const it = layoutModel.findItem(id)
+            if (it) layoutModel.updateItem(id, "visible", !it.visible)
+        }
 
-        posX: 280
-        posY: 280
-    }
+        function setVisible(id: string, visible: bool): void {
+            layoutModel.updateItem(id, "visible", visible)
+        }
 
-    // ---------------- Date ----------------
-    DateWidget.DateWindow {
-        id: dateWidget
+        function list(): string { return JSON.stringify(layoutModel.items, null, 2) }
+        function reload(): void { layoutModel.reload() }
+        function path(): string { return layoutModel.filePath }
 
-        themeMode: 0
+        // Phase-1 placeholder: opens / surfaces the launcher dock.
+        // Phase 2 will replace this with the full control panel.
+        function openControl(): void {
+            const it = layoutModel.items.find(function(s) { return s.type === "launcher" })
+            if (it) layoutModel.updateItem(it.id, "visible", true)
+        }
 
-        posX: 680
-        posY: 40
-        widgetWidth: 200
-        widgetHeight: 200
-    }
-
-    // ---------------- Launcher (control panel) ----------------
-    // Click a chip to toggle that widget's visibility. Add or
-    // remove items from the list to change the dock contents.
-    // The launcher itself is intentionally not in the list — to hide
-    // it, set `visible: false` here.
-    Launcher.LauncherWindow {
-        id: launcher
-
-        themeMode: 0
-
-        posX: 40
-        posY: 880
-
-        items: [
-            { label: "Date",   target: dateWidget   },
-            { label: "Clock",  target: clockDigital },
-            { label: "Analog", target: clockAnalog  },
-            { label: "Bat",    target: battery      },
-            { label: "Wthr",   target: weather      }
-        ]
+        function toggleLauncher(): void {
+            const it = layoutModel.items.find(function(s) { return s.type === "launcher" })
+            if (it) layoutModel.updateItem(it.id, "visible", !it.visible)
+        }
     }
 }
