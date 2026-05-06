@@ -4,7 +4,7 @@ Name=Nothing Widgets
 GenericName=Desktop Widgets
 Comment=Add, remove, and configure desktop widgets
 Icon=preferences-desktop
-Exec=qs ipc call nothing openControl
+Exec=qs -p /home/pushpank/3level/open/nothing-hyprland-widgets ipc call nothing toggleControl
 Terminal=false
 Categories=Utility;DesktopSettings;
 StartupNotify=false
@@ -12,8 +12,8 @@ Actions=Reload;ToggleDock;
 
 [Desktop Action Reload]
 Name=Reload Layout
-Exec=qs ipc call nothing reload
+Exec=qs -p /home/pushpank/3level/open/nothing-hyprland-widgets ipc call nothing reload
 
 [Desktop Action ToggleDock]
 Name=Toggle Launcher Dock
-Exec=qs ipc call nothing toggleLauncher
+Exec=qs -p /home/pushpank/3level/open/nothing-hyprland-widgets ipc call nothing toggleLauncher
