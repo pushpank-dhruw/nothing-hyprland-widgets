@@ -33,6 +33,15 @@ ShellRoot {
 
     LayoutModel { id: layoutModel }
 
+    // Control panel — full-screen modal overlay. Hidden by default;
+    // opened via `qs ipc call nothing openControl` or the .desktop entry.
+    ControlPanel {
+        id: controlPanel
+        layoutModel: layoutModel
+        visible: false
+        onCloseRequested: visible = false
+    }
+
     // ---- Components for dynamic instantiation ----
     Component { id: clockDigitalComp; ClockDigital.ClockDigitalWindow {} }
     Component { id: clockAnalogComp;  ClockAnalog.ClockAnalogWindow  {} }
@@ -217,12 +226,9 @@ ShellRoot {
         function reload(): void { layoutModel.reload() }
         function path(): string { return layoutModel.filePath }
 
-        // Phase-1 placeholder: opens / surfaces the launcher dock.
-        // Phase 2 will replace this with the full control panel.
-        function openControl(): void {
-            const it = layoutModel.items.find(function(s) { return s.type === "launcher" })
-            if (it) layoutModel.updateItem(it.id, "visible", true)
-        }
+        function openControl(): void   { controlPanel.visible = true }
+        function closeControl(): void  { controlPanel.visible = false }
+        function toggleControl(): void { controlPanel.visible = !controlPanel.visible }
 
         function toggleLauncher(): void {
             const it = layoutModel.items.find(function(s) { return s.type === "launcher" })
