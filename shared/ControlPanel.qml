@@ -55,7 +55,25 @@ PanelWindow {
         }
     }
 
-    onVisibleChanged: if (visible) panelBody.forceActiveFocus()
+    // Stray click/release events from the launcher that opened us can land
+    // on the freshly-shown panel ~1–2 s later (the press happened in another
+    // surface, the release lands here). Swallow close-requests during a brief
+    // grace window after the panel becomes visible.
+    property bool clickGuardActive: false
+    Timer {
+        id: clickGuardTimer
+        interval: 2000
+        repeat: false
+        onTriggered: panel.clickGuardActive = false
+    }
+
+    onVisibleChanged: {
+        if (visible) {
+            clickGuardActive = true
+            clickGuardTimer.restart()
+            panelBody.forceActiveFocus()
+        }
+    }
 
     // ---- Theme + fonts ----
     NothingColors { id: nColors; themeMode: 0 }
@@ -279,7 +297,7 @@ PanelWindow {
         opacity: 0.45
         MouseArea {
             anchors.fill: parent
-            onClicked: panel.closeRequested()
+            onClicked: if (!panel.clickGuardActive) panel.closeRequested()
         }
     }
 
@@ -381,7 +399,7 @@ PanelWindow {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: panel.closeRequested()
+                            onClicked: if (!panel.clickGuardActive) panel.closeRequested()
                         }
                     }
                 }
