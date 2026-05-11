@@ -28,6 +28,19 @@ PanelWindow {
     property real dragLocalY: 0
     property bool dragOverCanvas: false
 
+    // ---- Timezone picker state (modal popup, opened from inspector) ----
+    property bool tzPopupOpen: false
+    property string tzPopupTargetId: ""
+    property string tzPopupTargetKey: ""
+    property string tzPopupCurrentValue: ""
+
+    function openTimezonePicker(targetId, targetKey, currentValue) {
+        tzPopupTargetId = targetId
+        tzPopupTargetKey = targetKey
+        tzPopupCurrentValue = currentValue || ""
+        tzPopupOpen = true
+    }
+
     // ---- Window setup ----
     color: "transparent"
     anchors { top: true; bottom: true; left: true; right: true }
@@ -49,50 +62,160 @@ PanelWindow {
     FontLoader { id: ndotFont;   source: Qt.resolvedUrl("fonts/ndot.ttf") }
     FontLoader { id: ndot55Font; source: Qt.resolvedUrl("fonts/ndot-55.otf") }
 
-    // ---- Catalog: every widget type the panel can add ----
-    readonly property var catalog: [
+    // ---- Widget specs: every widget type, with editable property schema ----
+    // Each spec describes how the inspector should render that widget's
+    // controls. `properties` is the typed editor schema for `props.*`;
+    // `sizing` controls the SIZE editor (wh / square / auto).
+    // `hideFromCatalog: true` keeps a type out of the addable left-rail list
+    // while still letting the inspector recognise it when selected.
+    readonly property var widgetSpecs: [
         { type: "clockDigital", label: "Digital Clock", glyph: "◐",
           variants: ["Digital", "World"],
+          sizing: { mode: "wh", minW: 180, maxW: 800, minH: 60, maxH: 400 },
+          properties: [
+              { key: "use24HourFormat", label: "24-Hour Format", kind: "bool" },
+              { key: "cityName", label: "City Label", kind: "string",
+                placeholder: "Tokyo", showWhenVariant: 1 },
+              { key: "timeZone", label: "Timezone", kind: "timezone",
+                showWhenVariant: 1 }
+          ],
           defaults: { posX: 100, posY: 100,
                       size: { width: 320, height: 100 },
                       props: { use24HourFormat: false, cityName: "Tokyo", timeZone: "Asia/Tokyo" } } },
+
         { type: "clockAnalog", label: "Analog Clock", glyph: "◉",
           variants: ["Swiss", "Minimal"],
+          sizing: { mode: "square", min: 120, max: 400 },
+          properties: [
+              { key: "smoothHands", label: "Smooth Second Hand", kind: "bool" }
+          ],
           defaults: { posX: 100, posY: 220,
                       size: { size: 220 },
                       props: { smoothHands: true } } },
+
         { type: "battery", label: "Battery", glyph: "▮",
           variants: ["Default"],
+          sizing: { mode: "square", min: 120, max: 400 },
+          properties: [
+              { key: "showBluetoothDevices", label: "Bluetooth Devices", kind: "bool" }
+          ],
           defaults: { posX: 100, posY: 460,
                       size: { size: 220 },
                       props: { showBluetoothDevices: true } } },
+
         { type: "weather", label: "Weather", glyph: "☼",
           variants: ["Daily", "Hourly", "Now", "H/L"],
+          sizing: { mode: "auto", note: "Sized by variant" },
+          properties: [
+              { key: "location", label: "Location", kind: "string", placeholder: "London, UK" },
+              { key: "temperatureUnit", label: "Unit", kind: "enum",
+                choices: [{ label: "°C", value: 0 }, { label: "°F", value: 1 }] }
+          ],
           defaults: { posX: 400, posY: 100,
                       props: { location: "Raipur, IN", temperatureUnit: 0 } } },
+
         { type: "date", label: "Date", glyph: "▢",
           variants: ["Default"],
+          sizing: { mode: "wh", minW: 120, maxW: 400, minH: 120, maxH: 400 },
+          properties: [],
           defaults: { posX: 600, posY: 100,
-                      size: { width: 200, height: 200 } } }
+                      size: { width: 200, height: 200 } } },
+
+        { type: "launcher", label: "Launcher", glyph: "▤",
+          variants: ["Default"],
+          sizing: { mode: "auto", note: "Sized to chip count" },
+          hideFromCatalog: true,
+          properties: [],
+          defaults: { posX: 40, posY: 880 } }
     ]
+
+    // Subset shown in the left rail (excludes launcher).
+    readonly property var catalog: {
+        const out = []
+        for (let i = 0; i < widgetSpecs.length; i++)
+            if (!widgetSpecs[i].hideFromCatalog) out.push(widgetSpecs[i])
+        return out
+    }
+
+    // Timezone list, used by the inspector's timezone picker.
+    TimezonesData { id: timezonesData }
 
     // ---- Helpers ----
     function catalogFor(type) {
-        for (let i = 0; i < catalog.length; i++)
-            if (catalog[i].type === type) return catalog[i]
+        for (let i = 0; i < widgetSpecs.length; i++)
+            if (widgetSpecs[i].type === type) return widgetSpecs[i]
         return null
     }
 
     function labelFor(type) {
         const c = catalogFor(type)
-        if (c) return c.label
-        if (type === "launcher") return "Launcher Dock"
-        return type
+        return c ? c.label : type
     }
 
     function variantsFor(type) {
         const c = catalogFor(type)
         return c ? c.variants : ["Default"]
+    }
+
+    function sizingFor(type) {
+        const c = catalogFor(type)
+        return c ? c.sizing : { mode: "auto" }
+    }
+
+    // Filter the property schema for a given variant. Returning a *new*
+    // array each call is fine — the Repeater rebuilds its delegates when
+    // the binding fires anyway.
+    function propertiesFor(type, variant) {
+        const c = catalogFor(type)
+        if (!c || !c.properties) return []
+        const v = (variant === undefined ? 0 : variant)
+        return c.properties.filter(function(p) {
+            return p.showWhenVariant === undefined || p.showWhenVariant === v
+        })
+    }
+
+    // Resolve the *effective* value of a prop: layout JSON wins, catalog
+    // default fills the gap. Returns undefined when neither knows.
+    function propValue(spec, key) {
+        if (spec && spec.props && spec.props[key] !== undefined) return spec.props[key]
+        const c = catalogFor(spec ? spec.type : "")
+        if (c && c.defaults && c.defaults.props && c.defaults.props[key] !== undefined)
+            return c.defaults.props[key]
+        return undefined
+    }
+
+    // Resolve the effective size triple { mode, w, h, size } for a spec.
+    function effectiveSize(spec) {
+        const sz = sizingFor(spec.type)
+        if (sz.mode === "wh") {
+            const sw = (spec.size && spec.size.width  !== undefined) ? spec.size.width  : null
+            const sh = (spec.size && spec.size.height !== undefined) ? spec.size.height : null
+            const c = catalogFor(spec.type)
+            const dw = (c && c.defaults && c.defaults.size && c.defaults.size.width  !== undefined) ? c.defaults.size.width  : 200
+            const dh = (c && c.defaults && c.defaults.size && c.defaults.size.height !== undefined) ? c.defaults.size.height : 200
+            return { mode: "wh", w: (sw !== null ? sw : dw), h: (sh !== null ? sh : dh) }
+        }
+        if (sz.mode === "square") {
+            const ss = (spec.size && spec.size.size !== undefined) ? spec.size.size : null
+            const c = catalogFor(spec.type)
+            const ds = (c && c.defaults && c.defaults.size && c.defaults.size.size !== undefined) ? c.defaults.size.size : 220
+            return { mode: "square", size: (ss !== null ? ss : ds) }
+        }
+        return { mode: "auto" }
+    }
+
+    function tzLabel(id) {
+        if (!id || !timezonesData.timezones) return "—"
+        for (let i = 0; i < timezonesData.timezones.length; i++) {
+            const t = timezonesData.timezones[i]
+            if (t.id === id) {
+                const off = t.offset
+                const sign = off >= 0 ? "+" : ""
+                const offStr = (off === Math.floor(off)) ? off.toFixed(0) : off.toFixed(1)
+                return t.city + " · UTC" + sign + offStr
+            }
+        }
+        return id
     }
 
     function selectedItem() {
@@ -164,7 +287,7 @@ PanelWindow {
     Rectangle {
         id: panelBody
         anchors.centerIn: parent
-        width: 1100
+        width: 1140
         height: 720
         color: nColors.surface
         radius: 16
@@ -591,7 +714,7 @@ PanelWindow {
 
                 // ---- INSPECTOR ----
                 Rectangle {
-                    Layout.preferredWidth: 240
+                    Layout.preferredWidth: 270
                     Layout.fillHeight: true
                     color: "transparent"
 
@@ -636,246 +759,480 @@ PanelWindow {
                             }
                         }
 
-                        // ---- Selected ----
-                        ColumnLayout {
-                            id: inspectorSel
+                        // ---- Selected (scrollable body) ----
+                        QQC2.ScrollView {
+                            id: inspectorScroll
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            spacing: 14
                             visible: panel.selectedItem() !== null
+                            clip: true
+                            QQC2.ScrollBar.vertical.policy: QQC2.ScrollBar.AsNeeded
+                            QQC2.ScrollBar.horizontal.policy: QQC2.ScrollBar.AlwaysOff
 
-                            property var sel: panel.selectedItem()
-                            property bool removeArmed: false
-
-                            Connections {
-                                target: panel
-                                function onSelectedIdChanged() { inspectorSel.removeArmed = false }
-                            }
-
-                            // Type
                             ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 2
-                                Text {
-                                    text: "TYPE"
-                                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
-                                    color: nColors.textSecondary; opacity: 0.6
-                                }
-                                Text {
-                                    text: panel.labelFor(inspectorSel.sel ? inspectorSel.sel.type : "")
-                                    font.family: ndot55Font.name; font.pixelSize: 14
-                                    color: nColors.textPrimary
-                                }
-                                Text {
-                                    text: inspectorSel.sel ? inspectorSel.sel.id : ""
-                                    font.family: ndotFont.name; font.pixelSize: 10
-                                    color: nColors.textSecondary; opacity: 0.7
-                                }
-                            }
+                                id: inspectorSel
+                                width: inspectorScroll.availableWidth
+                                spacing: 14
 
-                            // Variant
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 6
-                                visible: inspectorSel.sel
-                                    && panel.variantsFor(inspectorSel.sel.type).length > 1
+                                property var sel: panel.selectedItem()
+                                property bool removeArmed: false
 
-                                Text {
-                                    text: "VARIANT"
-                                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
-                                    color: nColors.textSecondary; opacity: 0.6
+                                Connections {
+                                    target: panel
+                                    function onSelectedIdChanged() { inspectorSel.removeArmed = false }
                                 }
-                                Flow {
+
+                                // Type
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 2
+                                    Text {
+                                        text: "TYPE"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
+                                    Text {
+                                        text: panel.labelFor(inspectorSel.sel ? inspectorSel.sel.type : "")
+                                        font.family: ndot55Font.name; font.pixelSize: 14
+                                        color: nColors.textPrimary
+                                    }
+                                    Text {
+                                        text: inspectorSel.sel ? inspectorSel.sel.id : ""
+                                        font.family: ndotFont.name; font.pixelSize: 10
+                                        color: nColors.textSecondary; opacity: 0.7
+                                    }
+                                }
+
+                                // Variant
+                                ColumnLayout {
                                     Layout.fillWidth: true
                                     spacing: 6
+                                    visible: inspectorSel.sel
+                                        && panel.variantsFor(inspectorSel.sel.type).length > 1
+
+                                    Text {
+                                        text: "VARIANT"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
+                                    Flow {
+                                        Layout.fillWidth: true
+                                        spacing: 6
+
+                                        Repeater {
+                                            model: inspectorSel.sel
+                                                ? panel.variantsFor(inspectorSel.sel.type).length : 0
+
+                                            delegate: Rectangle {
+                                                required property int index
+                                                readonly property bool active:
+                                                    inspectorSel.sel && inspectorSel.sel.variant === index
+
+                                                width: 28; height: 24
+                                                radius: 6
+                                                color: active ? nColors.accent : "transparent"
+                                                border.color: active ? nColors.accent : nColors.divider
+                                                border.width: 1
+                                                Behavior on color { ColorAnimation { duration: 120 } }
+                                                Behavior on border.color { ColorAnimation { duration: 120 } }
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: index
+                                                    font.family: ndot55Font.name; font.pixelSize: 11
+                                                    color: active ? "#000" : nColors.textPrimary
+                                                }
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: if (inspectorSel.sel)
+                                                        panel.layoutModel.updateItem(inspectorSel.sel.id, "variant", index)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Theme
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Text {
+                                        text: "THEME"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
+                                    Row {
+                                        spacing: 6
+                                        Repeater {
+                                            model: ["DARK", "LIGHT"]
+                                            delegate: Rectangle {
+                                                required property int index
+                                                required property string modelData
+                                                readonly property bool active:
+                                                    inspectorSel.sel && inspectorSel.sel.themeMode === index
+
+                                                width: themeLbl.implicitWidth + 18
+                                                height: 24
+                                                radius: 12
+                                                color: active ? nColors.accent : "transparent"
+                                                border.color: active ? nColors.accent : nColors.divider
+                                                border.width: 1
+                                                Behavior on color { ColorAnimation { duration: 120 } }
+
+                                                Text {
+                                                    id: themeLbl
+                                                    anchors.centerIn: parent
+                                                    text: modelData
+                                                    font.family: ndotFont.name
+                                                    font.pixelSize: 9
+                                                    font.letterSpacing: 1.5
+                                                    color: active ? "#000" : nColors.textPrimary
+                                                }
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: if (inspectorSel.sel)
+                                                        panel.layoutModel.updateItem(inspectorSel.sel.id, "themeMode", index)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Visibility
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Text {
+                                        text: "VISIBILITY"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        height: 28
+                                        radius: 14
+                                        readonly property bool on:
+                                            inspectorSel.sel && inspectorSel.sel.visible !== false
+                                        color: on ? nColors.accent : "transparent"
+                                        border.color: on ? nColors.accent : nColors.divider
+                                        border.width: 1
+                                        Behavior on color { ColorAnimation { duration: 120 } }
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: parent.on ? "SHOWN" : "HIDDEN"
+                                            font.family: ndotFont.name
+                                            font.pixelSize: 9
+                                            font.letterSpacing: 1.5
+                                            color: parent.on ? "#000" : nColors.textPrimary
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: if (inspectorSel.sel)
+                                                panel.layoutModel.updateItem(
+                                                    inspectorSel.sel.id, "visible",
+                                                    !(inspectorSel.sel.visible !== false))
+                                        }
+                                    }
+                                }
+
+                                // ---- PROPERTIES (typed editor, per-widget schema) ----
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 10
+                                    visible: inspectorSel.sel
+                                        && panel.propertiesFor(inspectorSel.sel.type,
+                                                               inspectorSel.sel.variant).length > 0
+
+                                    Text {
+                                        text: "PROPERTIES"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
 
                                     Repeater {
+                                        // Per-property delegate dispatches on `kind` via Loader.
+                                        // The delegate exposes `prop` and `sel` for the loaded
+                                        // component to bind to (parent.prop / parent.sel).
                                         model: inspectorSel.sel
-                                            ? panel.variantsFor(inspectorSel.sel.type).length : 0
+                                            ? panel.propertiesFor(inspectorSel.sel.type,
+                                                                  inspectorSel.sel.variant)
+                                            : []
 
-                                        delegate: Rectangle {
-                                            required property int index
-                                            readonly property bool active:
-                                                inspectorSel.sel && inspectorSel.sel.variant === index
+                                        delegate: Loader {
+                                            required property var modelData
+                                            Layout.fillWidth: true
 
-                                            width: 28; height: 24
-                                            radius: 6
-                                            color: active ? nColors.accent : "transparent"
-                                            border.color: active ? nColors.accent : nColors.divider
-                                            border.width: 1
-                                            Behavior on color { ColorAnimation { duration: 120 } }
-                                            Behavior on border.color { ColorAnimation { duration: 120 } }
+                                            property var prop: modelData
+                                            property var sel: inspectorSel.sel
 
-                                            Text {
-                                                anchors.centerIn: parent
-                                                text: index
-                                                font.family: ndot55Font.name; font.pixelSize: 11
-                                                color: active ? "#000" : nColors.textPrimary
-                                            }
-                                            MouseArea {
-                                                anchors.fill: parent
-                                                cursorShape: Qt.PointingHandCursor
-                                                onClicked: if (inspectorSel.sel)
-                                                    panel.layoutModel.updateItem(inspectorSel.sel.id, "variant", index)
+                                            sourceComponent: {
+                                                switch (modelData.kind) {
+                                                case "bool":     return boolFieldComp
+                                                case "string":   return stringFieldComp
+                                                case "enum":     return enumFieldComp
+                                                case "timezone": return tzFieldComp
+                                                }
+                                                return null
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // Theme
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 6
-                                Text {
-                                    text: "THEME"
-                                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
-                                    color: nColors.textSecondary; opacity: 0.6
-                                }
-                                Row {
-                                    spacing: 6
-                                    Repeater {
-                                        model: ["DARK", "LIGHT"]
-                                        delegate: Rectangle {
-                                            required property int index
-                                            required property string modelData
-                                            readonly property bool active:
-                                                inspectorSel.sel && inspectorSel.sel.themeMode === index
-
-                                            width: themeLbl.implicitWidth + 18
-                                            height: 24
-                                            radius: 12
-                                            color: active ? nColors.accent : "transparent"
-                                            border.color: active ? nColors.accent : nColors.divider
-                                            border.width: 1
-                                            Behavior on color { ColorAnimation { duration: 120 } }
-
-                                            Text {
-                                                id: themeLbl
-                                                anchors.centerIn: parent
-                                                text: modelData
-                                                font.family: ndotFont.name
-                                                font.pixelSize: 9
-                                                font.letterSpacing: 1.5
-                                                color: active ? "#000" : nColors.textPrimary
-                                            }
-                                            MouseArea {
-                                                anchors.fill: parent
-                                                cursorShape: Qt.PointingHandCursor
-                                                onClicked: if (inspectorSel.sel)
-                                                    panel.layoutModel.updateItem(inspectorSel.sel.id, "themeMode", index)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Visibility
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 6
-                                Text {
-                                    text: "VISIBILITY"
-                                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
-                                    color: nColors.textSecondary; opacity: 0.6
-                                }
-                                Rectangle {
+                                // ---- SIZE editor (wh / square / auto) ----
+                                ColumnLayout {
+                                    id: sizeBlock
                                     Layout.fillWidth: true
-                                    height: 28
-                                    radius: 14
-                                    readonly property bool on:
-                                        inspectorSel.sel && inspectorSel.sel.visible !== false
-                                    color: on ? nColors.accent : "transparent"
-                                    border.color: on ? nColors.accent : nColors.divider
-                                    border.width: 1
-                                    Behavior on color { ColorAnimation { duration: 120 } }
+                                    spacing: 6
+                                    visible: inspectorSel.sel !== null
+
+                                    readonly property var sizing: inspectorSel.sel
+                                        ? panel.sizingFor(inspectorSel.sel.type) : ({ mode: "auto" })
+                                    readonly property var sizeNow: inspectorSel.sel
+                                        ? panel.effectiveSize(inspectorSel.sel) : ({ mode: "auto" })
 
                                     Text {
-                                        anchors.centerIn: parent
-                                        text: parent.on ? "SHOWN" : "HIDDEN"
-                                        font.family: ndotFont.name
-                                        font.pixelSize: 9
-                                        font.letterSpacing: 1.5
-                                        color: parent.on ? "#000" : nColors.textPrimary
+                                        text: "SIZE"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
                                     }
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: if (inspectorSel.sel)
-                                            panel.layoutModel.updateItem(
-                                                inspectorSel.sel.id, "visible",
-                                                !(inspectorSel.sel.visible !== false))
-                                    }
-                                }
-                            }
 
-                            // Position
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 4
-                                Text {
-                                    text: "POSITION"
-                                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
-                                    color: nColors.textSecondary; opacity: 0.6
-                                }
-                                Row {
-                                    spacing: 16
+                                    // Auto mode — display only
                                     Text {
-                                        text: "X " + (inspectorSel.sel ? inspectorSel.sel.posX : "—")
+                                        Layout.fillWidth: true
+                                        visible: sizeBlock.sizing.mode === "auto"
+                                        text: sizeBlock.sizing.note || "Auto"
                                         font.family: ndotFont.name; font.pixelSize: 11
-                                        color: nColors.textPrimary
+                                        color: nColors.textSecondary; opacity: 0.7
                                     }
-                                    Text {
-                                        text: "Y " + (inspectorSel.sel ? inspectorSel.sel.posY : "—")
-                                        font.family: ndotFont.name; font.pixelSize: 11
-                                        color: nColors.textPrimary
+
+                                    // wh mode — W and H side-by-side
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        visible: sizeBlock.sizing.mode === "wh"
+
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 2
+                                            Text {
+                                                text: "W"
+                                                font.family: ndotFont.name; font.pixelSize: 9
+                                                color: nColors.textSecondary; opacity: 0.55
+                                            }
+                                            Rectangle {
+                                                Layout.fillWidth: true
+                                                Layout.preferredHeight: 28
+                                                radius: 8
+                                                color: wInput.activeFocus ? nColors.background : "transparent"
+                                                border.color: wInput.activeFocus ? nColors.accent : nColors.divider
+                                                border.width: 1
+                                                Behavior on color { ColorAnimation { duration: 100 } }
+                                                Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                                                TextInput {
+                                                    id: wInput
+                                                    anchors.fill: parent
+                                                    anchors.leftMargin: 10
+                                                    anchors.rightMargin: 10
+                                                    verticalAlignment: TextInput.AlignVCenter
+                                                    clip: true
+                                                    selectByMouse: true
+                                                    inputMethodHints: Qt.ImhDigitsOnly
+                                                    validator: IntValidator { bottom: 0; top: 9999 }
+                                                    font.family: ndot55Font.name; font.pixelSize: 12
+                                                    color: nColors.textPrimary
+                                                    text: sizeBlock.sizeNow.w !== undefined
+                                                        ? String(sizeBlock.sizeNow.w) : ""
+                                                    onEditingFinished: {
+                                                        if (!inspectorSel.sel) return
+                                                        const sz = sizeBlock.sizing
+                                                        const minV = sz.minW !== undefined ? sz.minW : 1
+                                                        const maxV = sz.maxW !== undefined ? sz.maxW : 9999
+                                                        const v = Math.max(minV, Math.min(maxV, parseInt(text) || minV))
+                                                        panel.layoutModel.updateItem(
+                                                            inspectorSel.sel.id, "size.width", v)
+                                                        text = Qt.binding(function() {
+                                                            return sizeBlock.sizeNow.w !== undefined
+                                                                ? String(sizeBlock.sizeNow.w) : ""
+                                                        })
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 2
+                                            Text {
+                                                text: "H"
+                                                font.family: ndotFont.name; font.pixelSize: 9
+                                                color: nColors.textSecondary; opacity: 0.55
+                                            }
+                                            Rectangle {
+                                                Layout.fillWidth: true
+                                                Layout.preferredHeight: 28
+                                                radius: 8
+                                                color: hInput.activeFocus ? nColors.background : "transparent"
+                                                border.color: hInput.activeFocus ? nColors.accent : nColors.divider
+                                                border.width: 1
+                                                Behavior on color { ColorAnimation { duration: 100 } }
+                                                Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                                                TextInput {
+                                                    id: hInput
+                                                    anchors.fill: parent
+                                                    anchors.leftMargin: 10
+                                                    anchors.rightMargin: 10
+                                                    verticalAlignment: TextInput.AlignVCenter
+                                                    clip: true
+                                                    selectByMouse: true
+                                                    inputMethodHints: Qt.ImhDigitsOnly
+                                                    validator: IntValidator { bottom: 0; top: 9999 }
+                                                    font.family: ndot55Font.name; font.pixelSize: 12
+                                                    color: nColors.textPrimary
+                                                    text: sizeBlock.sizeNow.h !== undefined
+                                                        ? String(sizeBlock.sizeNow.h) : ""
+                                                    onEditingFinished: {
+                                                        if (!inspectorSel.sel) return
+                                                        const sz = sizeBlock.sizing
+                                                        const minV = sz.minH !== undefined ? sz.minH : 1
+                                                        const maxV = sz.maxH !== undefined ? sz.maxH : 9999
+                                                        const v = Math.max(minV, Math.min(maxV, parseInt(text) || minV))
+                                                        panel.layoutModel.updateItem(
+                                                            inspectorSel.sel.id, "size.height", v)
+                                                        text = Qt.binding(function() {
+                                                            return sizeBlock.sizeNow.h !== undefined
+                                                                ? String(sizeBlock.sizeNow.h) : ""
+                                                        })
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                }
-                            }
 
-                            Item { Layout.fillHeight: true }
+                                    // square mode — single dimension
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        visible: sizeBlock.sizing.mode === "square"
 
-                            // Remove (two-step)
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 36
-                                radius: 8
-                                color: inspectorSel.removeArmed ? nColors.error : "transparent"
-                                border.color: inspectorSel.removeArmed ? nColors.error : nColors.divider
-                                border.width: 1
-                                Behavior on color { ColorAnimation { duration: 150 } }
-                                Behavior on border.color { ColorAnimation { duration: 150 } }
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 2
+                                            Rectangle {
+                                                Layout.fillWidth: true
+                                                Layout.preferredHeight: 28
+                                                radius: 8
+                                                color: sInput.activeFocus ? nColors.background : "transparent"
+                                                border.color: sInput.activeFocus ? nColors.accent : nColors.divider
+                                                border.width: 1
+                                                Behavior on color { ColorAnimation { duration: 100 } }
+                                                Behavior on border.color { ColorAnimation { duration: 100 } }
 
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: inspectorSel.removeArmed ? "TAP AGAIN" : "REMOVE"
-                                    font.family: ndot55Font.name
-                                    font.pixelSize: 11
-                                    font.letterSpacing: 2
-                                    color: inspectorSel.removeArmed ? "#fff" : nColors.textPrimary
-                                }
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: {
-                                        if (inspectorSel.removeArmed) {
-                                            if (inspectorSel.sel)
-                                                panel.layoutModel.removeItem(inspectorSel.sel.id)
-                                            panel.selectedId = ""
-                                            inspectorSel.removeArmed = false
-                                        } else {
-                                            inspectorSel.removeArmed = true
-                                            disarmTimer.restart()
+                                                TextInput {
+                                                    id: sInput
+                                                    anchors.fill: parent
+                                                    anchors.leftMargin: 10
+                                                    anchors.rightMargin: 10
+                                                    verticalAlignment: TextInput.AlignVCenter
+                                                    clip: true
+                                                    selectByMouse: true
+                                                    inputMethodHints: Qt.ImhDigitsOnly
+                                                    validator: IntValidator { bottom: 0; top: 9999 }
+                                                    font.family: ndot55Font.name; font.pixelSize: 12
+                                                    color: nColors.textPrimary
+                                                    text: sizeBlock.sizeNow.size !== undefined
+                                                        ? String(sizeBlock.sizeNow.size) : ""
+                                                    onEditingFinished: {
+                                                        if (!inspectorSel.sel) return
+                                                        const sz = sizeBlock.sizing
+                                                        const minV = sz.min !== undefined ? sz.min : 1
+                                                        const maxV = sz.max !== undefined ? sz.max : 9999
+                                                        const v = Math.max(minV, Math.min(maxV, parseInt(text) || minV))
+                                                        panel.layoutModel.updateItem(
+                                                            inspectorSel.sel.id, "size.size", v)
+                                                        text = Qt.binding(function() {
+                                                            return sizeBlock.sizeNow.size !== undefined
+                                                                ? String(sizeBlock.sizeNow.size) : ""
+                                                        })
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
 
-                                Timer {
-                                    id: disarmTimer
-                                    interval: 1800
-                                    onTriggered: inspectorSel.removeArmed = false
+                                // Position
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 4
+                                    Text {
+                                        text: "POSITION"
+                                        font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                                        color: nColors.textSecondary; opacity: 0.6
+                                    }
+                                    Row {
+                                        spacing: 16
+                                        Text {
+                                            text: "X " + (inspectorSel.sel ? inspectorSel.sel.posX : "—")
+                                            font.family: ndotFont.name; font.pixelSize: 11
+                                            color: nColors.textPrimary
+                                        }
+                                        Text {
+                                            text: "Y " + (inspectorSel.sel ? inspectorSel.sel.posY : "—")
+                                            font.family: ndotFont.name; font.pixelSize: 11
+                                            color: nColors.textPrimary
+                                        }
+                                    }
                                 }
+                            }
+                        }
+
+                        // ---- Remove (pinned to bottom of inspector) ----
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 36
+                            visible: panel.selectedItem() !== null
+                            radius: 8
+                            color: inspectorSel.removeArmed ? nColors.error : "transparent"
+                            border.color: inspectorSel.removeArmed ? nColors.error : nColors.divider
+                            border.width: 1
+                            Behavior on color { ColorAnimation { duration: 150 } }
+                            Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: inspectorSel.removeArmed ? "TAP AGAIN" : "REMOVE"
+                                font.family: ndot55Font.name
+                                font.pixelSize: 11
+                                font.letterSpacing: 2
+                                color: inspectorSel.removeArmed ? "#fff" : nColors.textPrimary
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (inspectorSel.removeArmed) {
+                                        if (inspectorSel.sel)
+                                            panel.layoutModel.removeItem(inspectorSel.sel.id)
+                                        panel.selectedId = ""
+                                        inspectorSel.removeArmed = false
+                                    } else {
+                                        inspectorSel.removeArmed = true
+                                        disarmTimer.restart()
+                                    }
+                                }
+                            }
+
+                            Timer {
+                                id: disarmTimer
+                                interval: 1800
+                                onTriggered: inspectorSel.removeArmed = false
                             }
                         }
                     }
@@ -911,6 +1268,448 @@ PanelWindow {
                         font.pixelSize: 10
                         color: nColors.textSecondary
                         opacity: 0.5
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // Inspector field templates — instantiated by the PROPERTIES
+        // Repeater via Loader. Each delegate exposes `prop` (schema)
+        // and `sel` (selected layout item) on the Loader; the loaded
+        // root pulls them through `parent.prop` / `parent.sel`.
+        // ============================================================
+
+        // bool — ON / OFF pill
+        Component {
+            id: boolFieldComp
+            ColumnLayout {
+                spacing: 4
+                readonly property var prop: parent ? parent.prop : null
+                readonly property var sel:  parent ? parent.sel  : null
+                readonly property bool current: sel && prop
+                    ? (panel.propValue(sel, prop.key) === true) : false
+
+                Text {
+                    text: prop ? prop.label.toUpperCase() : ""
+                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                    color: nColors.textSecondary; opacity: 0.6
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 28
+                    radius: 14
+                    color: parent.current ? nColors.accent : "transparent"
+                    border.color: parent.current ? nColors.accent : nColors.divider
+                    border.width: 1
+                    Behavior on color { ColorAnimation { duration: 120 } }
+                    Behavior on border.color { ColorAnimation { duration: 120 } }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: parent.parent.current ? "ON" : "OFF"
+                        font.family: ndotFont.name
+                        font.pixelSize: 9
+                        font.letterSpacing: 1.5
+                        color: parent.parent.current ? "#000" : nColors.textPrimary
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            const root = parent.parent
+                            if (root.sel && root.prop)
+                                panel.layoutModel.updateItem(
+                                    root.sel.id, "props." + root.prop.key, !root.current)
+                        }
+                    }
+                }
+            }
+        }
+
+        // string — single-line text input. Commit on focus loss / Enter,
+        // then re-bind to the model so external updates flow back in.
+        Component {
+            id: stringFieldComp
+            ColumnLayout {
+                id: stringRoot
+                spacing: 4
+                readonly property var prop: parent ? parent.prop : null
+                readonly property var sel:  parent ? parent.sel  : null
+
+                Text {
+                    text: stringRoot.prop ? stringRoot.prop.label.toUpperCase() : ""
+                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                    color: nColors.textSecondary; opacity: 0.6
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    radius: 8
+                    color: stringInput.activeFocus ? nColors.background : "transparent"
+                    border.color: stringInput.activeFocus ? nColors.accent : nColors.divider
+                    border.width: 1
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                    TextInput {
+                        id: stringInput
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        clip: true
+                        selectByMouse: true
+                        font.family: ndot55Font.name; font.pixelSize: 12
+                        color: nColors.textPrimary
+                        text: stringRoot.sel && stringRoot.prop
+                            ? (panel.propValue(stringRoot.sel, stringRoot.prop.key) || "") : ""
+
+                        onEditingFinished: {
+                            if (!stringRoot.sel || !stringRoot.prop) return
+                            const cur = panel.propValue(stringRoot.sel, stringRoot.prop.key) || ""
+                            if (text !== cur) {
+                                panel.layoutModel.updateItem(
+                                    stringRoot.sel.id, "props." + stringRoot.prop.key, text)
+                            }
+                            text = Qt.binding(function() {
+                                return stringRoot.sel && stringRoot.prop
+                                    ? (panel.propValue(stringRoot.sel, stringRoot.prop.key) || "") : ""
+                            })
+                        }
+
+                        Text {
+                            anchors.fill: parent
+                            verticalAlignment: Text.AlignVCenter
+                            text: stringRoot.prop && stringRoot.prop.placeholder
+                                ? stringRoot.prop.placeholder : ""
+                            visible: !stringInput.text && !stringInput.activeFocus
+                            font: stringInput.font
+                            color: nColors.textPlaceholder
+                            opacity: 0.6
+                        }
+                    }
+                }
+            }
+        }
+
+        // enum — chip row, like THEME but with custom labels per choice
+        Component {
+            id: enumFieldComp
+            ColumnLayout {
+                id: enumRoot
+                spacing: 6
+                readonly property var prop: parent ? parent.prop : null
+                readonly property var sel:  parent ? parent.sel  : null
+
+                Text {
+                    text: enumRoot.prop ? enumRoot.prop.label.toUpperCase() : ""
+                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                    color: nColors.textSecondary; opacity: 0.6
+                }
+                Row {
+                    spacing: 6
+                    Repeater {
+                        model: enumRoot.prop ? enumRoot.prop.choices : []
+                        delegate: Rectangle {
+                            required property var modelData
+                            readonly property bool active: enumRoot.sel && enumRoot.prop
+                                && panel.propValue(enumRoot.sel, enumRoot.prop.key) === modelData.value
+
+                            width: enumLbl.implicitWidth + 18
+                            height: 24
+                            radius: 12
+                            color: active ? nColors.accent : "transparent"
+                            border.color: active ? nColors.accent : nColors.divider
+                            border.width: 1
+                            Behavior on color { ColorAnimation { duration: 120 } }
+
+                            Text {
+                                id: enumLbl
+                                anchors.centerIn: parent
+                                text: parent.modelData.label
+                                font.family: ndotFont.name
+                                font.pixelSize: 10
+                                font.letterSpacing: 1
+                                color: parent.active ? "#000" : nColors.textPrimary
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (enumRoot.sel && enumRoot.prop)
+                                        panel.layoutModel.updateItem(
+                                            enumRoot.sel.id,
+                                            "props." + enumRoot.prop.key,
+                                            parent.modelData.value)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // timezone — clickable pill that opens the modal picker
+        Component {
+            id: tzFieldComp
+            ColumnLayout {
+                id: tzRoot
+                spacing: 4
+                readonly property var prop: parent ? parent.prop : null
+                readonly property var sel:  parent ? parent.sel  : null
+                readonly property string currentId: tzRoot.sel && tzRoot.prop
+                    ? (panel.propValue(tzRoot.sel, tzRoot.prop.key) || "") : ""
+
+                Text {
+                    text: tzRoot.prop ? tzRoot.prop.label.toUpperCase() : ""
+                    font.family: ndotFont.name; font.pixelSize: 9; font.letterSpacing: 1.5
+                    color: nColors.textSecondary; opacity: 0.6
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    radius: 8
+                    color: tzHover.containsMouse ? nColors.background : "transparent"
+                    border.color: tzHover.containsMouse ? nColors.accent : nColors.divider
+                    border.width: 1
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 4
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: panel.tzLabel(tzRoot.currentId)
+                            font.family: ndot55Font.name; font.pixelSize: 11
+                            color: nColors.textPrimary
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            text: "▾"
+                            font.pixelSize: 11
+                            color: nColors.textSecondary
+                        }
+                    }
+                    MouseArea {
+                        id: tzHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (tzRoot.sel && tzRoot.prop)
+                                panel.openTimezonePicker(
+                                    tzRoot.sel.id, tzRoot.prop.key, tzRoot.currentId)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // Timezone picker modal — centred over panelBody, dims everything
+        // beneath. Search filters the list as you type.
+        // ============================================================
+        MouseArea {
+            // Outside-click catcher — sits below the popup, blocks clicks
+            // to the inspector / canvas while the picker is open.
+            visible: panel.tzPopupOpen
+            anchors.fill: parent
+            z: 1499
+            onClicked: panel.tzPopupOpen = false
+        }
+
+        Rectangle {
+            id: tzPopup
+            visible: panel.tzPopupOpen
+            width: 360
+            height: 460
+            x: (panelBody.width  - width)  / 2
+            y: (panelBody.height - height) / 2
+            color: nColors.surface
+            border.color: nColors.divider
+            border.width: 1
+            radius: 12
+            z: 1500
+            focus: visible
+
+            property string searchText: ""
+
+            onVisibleChanged: {
+                if (visible) {
+                    searchText = ""
+                    tzSearchInput.text = ""
+                    tzSearchInput.forceActiveFocus()
+                }
+            }
+
+            Keys.onEscapePressed: panel.tzPopupOpen = false
+
+            // Filtered list. Returns full list when search is empty.
+            function filtered() {
+                const list = timezonesData.timezones || []
+                const q = (searchText || "").toLowerCase().trim()
+                if (!q) return list
+                return list.filter(function(tz) {
+                    const city = (tz.city    || "").toLowerCase()
+                    const cc   = (tz.country || "").toLowerCase()
+                    const id   = (tz.id      || "").toLowerCase()
+                    return city.indexOf(q) !== -1 || cc.indexOf(q) !== -1 || id.indexOf(q) !== -1
+                })
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+
+                // Header
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        Layout.fillWidth: true
+                        text: "SELECT TIMEZONE"
+                        font.family: ndot55Font.name
+                        font.pixelSize: 11
+                        font.letterSpacing: 2
+                        color: nColors.textPrimary
+                    }
+                    Rectangle {
+                        Layout.preferredWidth: 24
+                        Layout.preferredHeight: 24
+                        radius: 12
+                        color: tzCloseHover.containsMouse ? nColors.divider : "transparent"
+                        Behavior on color { ColorAnimation { duration: 120 } }
+                        Text {
+                            anchors.centerIn: parent
+                            text: "✕"
+                            font.pixelSize: 12
+                            color: nColors.textSecondary
+                        }
+                        MouseArea {
+                            id: tzCloseHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: panel.tzPopupOpen = false
+                        }
+                    }
+                }
+
+                // Search
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 32
+                    radius: 8
+                    color: tzSearchInput.activeFocus ? nColors.background : "transparent"
+                    border.color: tzSearchInput.activeFocus ? nColors.accent : nColors.divider
+                    border.width: 1
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Behavior on border.color { ColorAnimation { duration: 100 } }
+
+                    TextInput {
+                        id: tzSearchInput
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        clip: true
+                        selectByMouse: true
+                        font.family: ndot55Font.name
+                        font.pixelSize: 12
+                        color: nColors.textPrimary
+                        onTextChanged: tzPopup.searchText = text
+                        Keys.onEscapePressed: panel.tzPopupOpen = false
+
+                        Text {
+                            anchors.fill: parent
+                            verticalAlignment: Text.AlignVCenter
+                            text: "Search city or country…"
+                            visible: !tzSearchInput.text && !tzSearchInput.activeFocus
+                            font: tzSearchInput.font
+                            color: nColors.textPlaceholder
+                            opacity: 0.6
+                        }
+                    }
+                }
+
+                // List
+                ListView {
+                    id: tzList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 2
+                    boundsBehavior: Flickable.StopAtBounds
+                    model: tzPopup.filtered()
+
+                    QQC2.ScrollBar.vertical: QQC2.ScrollBar { policy: QQC2.ScrollBar.AsNeeded }
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: tzList.width
+                        height: 34
+                        radius: 6
+                        readonly property bool isCurrent: modelData
+                            && modelData.id === panel.tzPopupCurrentValue
+                        color: tzRowMa.containsMouse
+                            ? nColors.background
+                            : (isCurrent ? "#22ff4444" : "transparent")
+                        Behavior on color { ColorAnimation { duration: 80 } }
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            spacing: 8
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: parent.parent.modelData
+                                    ? (parent.parent.modelData.city + ", "
+                                       + (parent.parent.modelData.country || ""))
+                                    : ""
+                                font.family: ndot55Font.name
+                                font.pixelSize: 11
+                                color: nColors.textPrimary
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                text: {
+                                    const m = parent.parent.modelData
+                                    if (!m) return ""
+                                    const o = m.offset
+                                    const s = o >= 0 ? "+" : ""
+                                    const v = (o === Math.floor(o)) ? o.toFixed(0) : o.toFixed(1)
+                                    return "UTC" + s + v
+                                }
+                                font.family: ndotFont.name
+                                font.pixelSize: 10
+                                color: nColors.textSecondary
+                                opacity: 0.8
+                            }
+                        }
+
+                        MouseArea {
+                            id: tzRowMa
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                const m = parent.modelData
+                                if (m && panel.tzPopupTargetId) {
+                                    panel.layoutModel.updateItem(
+                                        panel.tzPopupTargetId,
+                                        "props." + panel.tzPopupTargetKey,
+                                        m.id)
+                                }
+                                panel.tzPopupOpen = false
+                            }
+                        }
                     }
                 }
             }
